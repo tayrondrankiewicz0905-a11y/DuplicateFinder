@@ -1,0 +1,130 @@
+name: Build Duplicate Finder
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build macOS App + DMG
+    runs-on: macos-14
+
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Swift Version anzeigen
+        run: swift --version
+
+      - name: Swift Package bauen
+        run: |
+          swift build -c release
+
+      - name: App erstellen
+        run: |
+          set -e
+
+          APP_NAME="Duplicate Finder"
+          APP_DIR="build/${APP_NAME}.app"
+
+          rm -rf build
+          mkdir -p "$APP_DIR/Contents/MacOS"
+          mkdir -p "$APP_DIR/Contents/Resources"
+
+          cp ".build/release/DuplicateFinder" \
+             "$APP_DIR/Contents/MacOS/DuplicateFinder"
+
+          chmod +x "$APP_DIR/Contents/MacOS/DuplicateFinder"
+
+          cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+          "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDisplayName</key>
+              <string>Duplicate Finder</string>
+
+              <key>CFBundleExecutable</key>
+              <string>DuplicateFinder</string>
+
+              <key>CFBundleIdentifier</key>
+              <string>com.tayron.duplicatefinder</string>
+
+              <key>CFBundleName</key>
+              <string>Duplicate Finder</string>
+
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+
+              <key>CFBundleShortVersionString</key>
+              <string>1.0.0</string>
+
+              <key>CFBundleVersion</key>
+              <string>1</string>
+
+              <key>LSMinimumSystemVersion</key>
+              <string>13.0</string>
+
+              <key>NSHighResolutionCapable</key>
+              <true/>
+
+              <key>NSHumanReadableCopyright</key>
+              <string>© 2026 Tayron</string>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: App Icon hinzufügen
+        run: |
+          if [ -f "Resources/AppIcon.icns" ]; then
+            cp "Resources/AppIcon.icns" \
+              "build/Duplicate Finder.app/Contents/Resources/AppIcon.icns"
+
+            /usr/libexec/PlistBuddy -c \
+              "Add :CFBundleIconFile string AppIcon" \
+              "build/Duplicate Finder.app/Contents/Info.plist" || true
+          fi
+
+      - name: App testen
+        run: |
+          test -f "build/Duplicate Finder.app/Contents/MacOS/DuplicateFinder"
+          test -f "build/Duplicate Finder.app/Contents/Info.plist"
+
+      - name: DMG erstellen
+        run: |
+          set -e
+
+          rm -rf dmg
+          mkdir -p dmg
+
+          cp -R "build/Duplicate Finder.app" dmg/
+
+          ln -s /Applications dmg/Applications
+
+          hdiutil create \
+            -volname "Duplicate Finder" \
+            -srcfolder dmg \
+            -ov \
+            -format UDZO \
+            "Duplicate-Finder.dmg"
+
+      - name: Dateien für GitHub Actions bereitstellen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Duplicate-Finder-macOS
+          path: |
+            build/Duplicate Finder.app
+            Duplicate-Finder.dmg
+
+      - name: GitHub Release erstellen
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Duplicate-Finder.dmg
