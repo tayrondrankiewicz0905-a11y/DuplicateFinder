@@ -1,254 +1,317 @@
 import SwiftUI
 import AppKit
+import Foundation
 import CryptoKit
+import UniformTypeIdentifiers
+
+struct DuplicateFile: Identifiable, Hashable {
+    let id = UUID()
+    let url: URL
+    let size: Int64
+    let hash: String
+
+    var name: String {
+        url.lastPathComponent
+    }
+
+    var path: String {
+        url.path
+    }
+
+    var formattedSize: String {
+        ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+    }
+}
+
+struct DuplicateGroup: Identifiable {
+    let id = UUID()
+    let hash: String
+    let files: [DuplicateFile]
+
+    var wastedBytes: Int64 {
+        guard files.count > 1 else { return 0 }
+        return files.dropFirst().reduce(0) { $0 + $1.size }
+    }
+
+    var wastedSize: String {
+        ByteCountFormatter.string(fromByteCount: wastedBytes, countStyle: .file)
+    }
+}
+
+@MainActor
+final class DuplicateFinderModel: ObservableObject {
+    @Published var groups: [DuplicateGroup] = []
+    @Published var isScanning = false
+    @Published var progress: Double = 0
+    @Published var status = "Choose a folder to scan."
+    @Published var errorMessage: String?
+    @Published var selectedPaths: Set<String> = []
+
+    var duplicateCount: Int {
+        groups.reduce(0) { $0 + $1.files.count }
+    }
+
+    var groupCount: Int {
+        groups.count
+    }
+
+    var reclaimableBytes: Int64 {
+        groups.reduce(0) { $0 + $1.wastedBytes }
+    }
+
+    var reclaimableSize: String {
+        ByteCountFormatter.string(fromByteCount: reclaimableBytes, countStyle: .file)
+    }
+
+    func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose a folder to scan"
+        panel.message = "Duplicate Finder searches this folder and its subfolders."
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = false
+
+        if panel.runModal() == .OK, let folder = panel.url {
+            scan(folder)
+        }
+    }
+
+    func scan(_ folder: URL) {
+        guard !isScanning else { return }
+
+        isScanning = true
+        progress = 0
+        groups = []
+        selectedPaths.removeAll()
+        errorMessage = nil
+        status = "Collecting files…"
+
+        // Everything is intentionally kept on the MainActor.
+        // This avoids Swift 6 concurrency/capture errors and keeps the project
+        // simple and reliable for the first version.
+        Task { @MainActor in
+            do {
+                let files = try Self.collectRegularFiles(in: folder)
+
+                if files.isEmpty {
+                    status = "No files found."
+                    progress = 1
+                    isScanning = false
+                    return
+                }
+
+                status = "Checking \(files.count.formatted()) files…"
+                progress = 0.1
+
+                var bySize: [Int64: [URL]] = [:]
+
+                for (index, url) in files.enumerated() {
+                    let values = try url.resourceValues(forKeys: [.fileSizeKey])
+                    let size = Int64(values.fileSize ?? 0)
+                    bySize[size, default: []].append(url)
+
+                    if index % 100 == 0 {
+                        progress = 0.1 + (Double(index) / Double(files.count)) * 0.2
+                        status = "Checking file \(index.formatted()) of \(files.count.formatted())…"
+                        await Task.yield()
+                    }
+                }
+
+                let candidates = bySize.values.filter { $0.count > 1 }
+                let candidateCount = candidates.reduce(0) { $0 + $1.count }
+
+                if candidateCount == 0 {
+                    status = "No exact duplicates found."
+                    progress = 1
+                    isScanning = false
+                    return
+                }
+
+                status = "Comparing \(candidateCount.formatted()) matching-size files…"
+
+                var hashGroups: [String: [DuplicateFile]] = [:]
+                var processed = 0
+
+                for urls in candidates {
+                    for url in urls {
+                        let values = try url.resourceValues(forKeys: [.fileSizeKey])
+                        let size = Int64(values.fileSize ?? 0)
+
+                        let hash = try Self.sha256(for: url)
+                        let file = DuplicateFile(
+                            url: url,
+                            size: size,
+                            hash: hash
+                        )
+
+                        hashGroups[hash, default: []].append(file)
+
+                        processed += 1
+                        progress = 0.3 + (Double(processed) / Double(candidateCount)) * 0.7
+                        status = "Analyzing \(processed.formatted()) of \(candidateCount.formatted())…"
+
+                        if processed % 10 == 0 {
+                            await Task.yield()
+                        }
+                    }
+                }
+
+                groups = hashGroups.values
+                    .filter { $0.count > 1 }
+                    .map {
+                        DuplicateGroup(
+                            hash: $0.first?.hash ?? "",
+                            files: $0.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+                        )
+                    }
+                    .sorted {
+                        if $0.wastedBytes != $1.wastedBytes {
+                            return $0.wastedBytes > $1.wastedBytes
+                        }
+                        return $0.files.count > $1.files.count
+                    }
+
+                progress = 1
+                isScanning = false
+
+                if groups.isEmpty {
+                    status = "No exact duplicates found."
+                } else {
+                    status = "Found \(groups.count) duplicate groups."
+                    selectKeepFirst()
+                }
+            } catch {
+                isScanning = false
+                progress = 0
+                status = "Scan failed."
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func selectKeepFirst() {
+        selectedPaths.removeAll()
+
+        for group in groups {
+            for file in group.files.dropFirst() {
+                selectedPaths.insert(file.path)
+            }
+        }
+    }
+
+    func clearSelection() {
+        selectedPaths.removeAll()
+    }
+
+    func toggle(_ file: DuplicateFile) {
+        if selectedPaths.contains(file.path) {
+            selectedPaths.remove(file.path)
+        } else {
+            selectedPaths.insert(file.path)
+        }
+    }
+
+    func deleteSelected() {
+        let urls = groups
+            .flatMap(\.files)
+            .filter { selectedPaths.contains($0.path) }
+            .map(\.url)
+
+        guard !urls.isEmpty else { return }
+
+        var failed = 0
+
+        for url in urls {
+            do {
+                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            } catch {
+                failed += 1
+            }
+        }
+
+        selectedPaths.removeAll()
+
+        if failed > 0 {
+            errorMessage = "\(failed) file(s) could not be moved to the Trash."
+        }
+
+        status = "\(urls.count - failed) file(s) moved to Trash."
+    }
+
+    private static func collectRegularFiles(in folder: URL) throws -> [URL] {
+        let keys: [URLResourceKey] = [
+            .isRegularFileKey,
+            .isDirectoryKey,
+            .isSymbolicLinkKey,
+            .fileSizeKey
+        ]
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: folder,
+            includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles],
+            errorHandler: { _, _ in
+                true
+            }
+        ) else {
+            return []
+        }
+
+        var result: [URL] = []
+
+        for case let url as URL in enumerator {
+            do {
+                let values = try url.resourceValues(forKeys: Set(keys))
+
+                if values.isSymbolicLink == true {
+                    continue
+                }
+
+                if values.isRegularFile == true {
+                    result.append(url)
+                }
+            } catch {
+                continue
+            }
+        }
+
+        return result
+    }
+
+    private static func sha256(for url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer {
+            try? handle.close()
+        }
+
+        var hasher = SHA256()
+
+        while true {
+            let data = try handle.read(upToCount: 1024 * 1024) ?? Data()
+
+            if data.isEmpty {
+                break
+            }
+
+            hasher.update(data: data)
+        }
+
+        return hasher.finalize()
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+}
 
 @main
 struct DuplicateFinderApp: App {
     var body: some Scene {
         WindowGroup("Duplicate Finder") {
             ContentView()
-                .frame(minWidth: 980, minHeight: 680)
+                .frame(minWidth: 900, minHeight: 600)
         }
         .windowResizability(.contentSize)
-        .commands {
-            CommandGroup(after: .newItem) {
-                Button("Scan Folder…") {
-                    NotificationCenter.default.post(name: .duplicateFinderChooseFolder, object: nil)
-                }
-                .keyboardShortcut("o", modifiers: [.command])
-            }
-        }
     }
-}
-
-extension Notification.Name {
-    static let duplicateFinderChooseFolder = Notification.Name("DuplicateFinderChooseFolder")
-}
-
-struct DuplicateItem: Identifiable, Hashable {
-    let id: URL
-    let url: URL
-    let size: Int64
-}
-
-struct DuplicateGroup: Identifiable {
-    let id: String
-    let hash: String
-    let size: Int64
-    let items: [DuplicateItem]
-
-    var wastedBytes: Int64 {
-        max(0, Int64(items.count - 1)) * size
-    }
-}
-
-@MainActor
-final class DuplicateFinderModel: ObservableObject {
-    @Published var selectedFolder: URL?
-    @Published var groups: [DuplicateGroup] = []
-    @Published var isScanning = false
-    @Published var progress = 0.0
-    @Published var status = "Choose a folder to begin."
-    @Published var selectedURLs: Set<URL> = []
-    @Published var errorMessage: String?
-
-    private let fileManager = FileManager.default
-
-    var totalDuplicateFiles: Int {
-        groups.reduce(0) { $0 + $1.items.count }
-    }
-
-    var duplicateBytes: Int64 {
-        groups.reduce(0) { $0 + $1.wastedBytes }
-    }
-
-    func chooseFolder() {
-        let panel = NSOpenPanel()
-        panel.title = "Choose a folder to scan"
-        panel.prompt = "Scan"
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
-            selectedFolder = url
-            groups = []
-            selectedURLs = []
-            status = "Ready to scan \(url.lastPathComponent)."
-            errorMessage = nil
-        }
-    }
-
-    func scan() {
-        guard let folder = selectedFolder, !isScanning else { return }
-        groups = []
-        selectedURLs = []
-        errorMessage = nil
-        isScanning = true
-        progress = 0
-        status = "Collecting files…"
-
-        Task.detached(priority: .userInitiated) { [weak self] in
-            do {
-                let files = try Self.collectRegularFiles(in: folder)
-                await MainActor.run {
-                    self?.status = "Analyzing \(files.count.formatted()) files…"
-                    self?.progress = 0.05
-                }
-
-                let duplicateGroups = try Self.findDuplicates(files) { done, total in
-                    let p = total == 0 ? 1.0 : 0.05 + (Double(done) / Double(total)) * 0.95
-                    Task { @MainActor [weak self] in
-                        self?.progress = p
-                        self?.status = "Analyzing file \(done.formatted()) of \(total.formatted())…"
-                    }
-                }
-
-                await MainActor.run {
-                    self?.groups = duplicateGroups
-                    self?.isScanning = false
-                    self?.progress = 1
-                    self?.status = duplicateGroups.isEmpty
-                        ? "No exact duplicates found."
-                        : "Found \(duplicateGroups.count) duplicate groups."
-                }
-            } catch is CancellationError {
-                await MainActor.run {
-                    self?.isScanning = false
-                    self?.status = "Scan cancelled."
-                }
-            } catch {
-                await MainActor.run {
-                    self?.isScanning = false
-                    self?.status = "Scan failed."
-                    self?.errorMessage = error.localizedDescription
-                }
-            }
-        }
-    }
-
-    func toggleSelection(_ url: URL) {
-        if selectedURLs.contains(url) {
-            selectedURLs.remove(url)
-        } else {
-            selectedURLs.insert(url)
-        }
-    }
-
-    func selectAllButFirst(in group: DuplicateGroup) {
-        for item in group.items.dropFirst() {
-            selectedURLs.insert(item.url)
-        }
-    }
-
-    func clearSelection() {
-        selectedURLs.removeAll()
-    }
-
-    func moveSelectedToTrash() {
-        let targets = selectedURLs.filter { url in
-            groups.contains(where: { $0.items.contains(where: { $0.url == url }) })
-        }
-        guard !targets.isEmpty else { return }
-
-        var failed: [String] = []
-        for url in targets {
-            do {
-                try fileManager.trashItem(at: url, resultingItemURL: nil)
-            } catch {
-                failed.append(url.lastPathComponent)
-            }
-        }
-
-        selectedURLs.removeAll()
-        groups = groups.compactMap { group in
-            let remaining = group.items.filter { !targets.contains($0.url) }
-            guard remaining.count > 1 else { return nil }
-            return DuplicateGroup(id: group.id, hash: group.hash, size: group.size, items: remaining)
-        }
-
-        if failed.isEmpty {
-            status = "Moved \(targets.count) file(s) to the Trash."
-        } else {
-            errorMessage = "Could not move: \(failed.joined(separator: ", "))"
-        }
-    }
-
-    private static func collectRegularFiles(in folder: URL) throws -> [URL] {
-        let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey]
-        let options: FileManager.DirectoryEnumerationOptions = [.skipsHiddenFiles, .skipsPackageDescendants]
-        guard let enumerator = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: Array(keys), options: options) else {
-            throw NSError(domain: "DuplicateFinder", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not read the selected folder."])
-        }
-
-        var urls: [URL] = []
-        for case let url as URL in enumerator {
-            do {
-                let values = try url.resourceValues(forKeys: keys)
-                if values.isSymbolicLink == true { continue }
-                if values.isRegularFile == true { urls.append(url) }
-            } catch {
-                continue
-            }
-        }
-        return urls
-    }
-
-    private static func findDuplicates(_ files: [URL], progress: @escaping @Sendable (Int, Int) -> Void) throws -> [DuplicateGroup] {
-        var bySize: [Int64: [URL]] = [:]
-        for url in files {
-            do {
-                let size = try fileSize(url)
-                bySize[size, default: []].append(url)
-            } catch {
-                continue
-            }
-        }
-
-        let candidates = bySize.values.filter { $0.count > 1 }.flatMap { $0 }
-        var buckets: [String: [DuplicateItem]] = [:]
-        var done = 0
-        let total = candidates.count
-        for url in candidates {
-            if Task.isCancelled { throw CancellationError() }
-            do {
-                let size = try fileSize(url)
-                let hash = try sha256(of: url)
-                buckets[hash, default: []].append(DuplicateItem(id: url, url: url, size: size))
-            } catch {
-                // Ignore unreadable files.
-            }
-            done += 1
-            progress(done, total)
-        }
-
-        return buckets.compactMap { hash, items in
-            guard items.count > 1 else { return nil }
-            let sorted = items.sorted { $0.url.path.localizedStandardCompare($1.url.path) == .orderedAscending }
-            return DuplicateGroup(id: hash, hash: hash, size: sorted[0].size, items: sorted)
-        }
-        .sorted {
-            if $0.wastedBytes != $1.wastedBytes { return $0.wastedBytes > $1.wastedBytes }
-            return $0.items[0].url.path < $1.items[0].url.path
-        }
-    }
-
-    private static func fileSize(_ url: URL) throws -> Int64 {
-        let values = try url.resourceValues(forKeys: [.fileSizeKey])
-        return Int64(values.fileSize ?? 0)
-    }
-
-    private static func sha256(of url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var hasher = SHA256()
-        while true {
-            let chunk = try handle.read(upToCount: 1024 * 1024) ?? Data()
-            if chunk.isEmpty { break }
-            hasher.update(data: chunk)
-        }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
-    }
-
 }
 
 struct ContentView: View {
@@ -257,200 +320,208 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+
             Divider()
-            content
+
+            if model.groups.isEmpty && !model.isScanning {
+                emptyState
+            } else {
+                results
+            }
+
             Divider()
-            footer
+
+            bottomBar
         }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .onReceive(NotificationCenter.default.publisher(for: .duplicateFinderChooseFolder)) { _ in
-            model.chooseFolder()
-        }
-        .alert("Scan Error", isPresented: Binding(
-            get: { model.errorMessage != nil },
-            set: { if !$0 { model.errorMessage = nil } }
-        )) {
-            Button("OK") { model.errorMessage = nil }
+        .alert(
+            "Error",
+            isPresented: Binding(
+                get: { model.errorMessage != nil },
+                set: { if !$0 { model.errorMessage = nil } }
+            )
+        ) {
+            Button("OK") {
+                model.errorMessage = nil
+            }
         } message: {
-            Text(model.errorMessage ?? "Unknown error")
+            Text(model.errorMessage ?? "")
         }
     }
 
     private var header: some View {
-        HStack(spacing: 14) {
-            Image(systemName: "doc.on.doc.fill")
-                .font(.system(size: 28, weight: .semibold))
-                .frame(width: 50, height: 50)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+        HStack(spacing: 16) {
+            Image(systemName: "doc.on.doc")
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundStyle(.blue)
 
             VStack(alignment: .leading, spacing: 3) {
                 Text("Duplicate Finder")
-                    .font(.system(size: 24, weight: .bold))
-                Text(model.selectedFolder?.path ?? "No folder selected")
-                    .font(.caption)
+                    .font(.system(size: 25, weight: .bold))
+
+                Text(model.status)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+
             Spacer()
 
-            Button("Choose Folder…") { model.chooseFolder() }
-                .keyboardShortcut("o", modifiers: [.command])
+            if model.isScanning {
+                ProgressView(value: model.progress)
+                    .frame(width: 180)
 
-            Button {
-                model.scan()
-            } label: {
-                Label(model.isScanning ? "Scanning…" : "Scan", systemImage: "magnifyingglass")
+                Text("\(Int(model.progress * 100))%")
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+
+            Button("Choose Folder…") {
+                model.chooseFolder()
             }
             .buttonStyle(.borderedProminent)
-            .disabled(model.selectedFolder == nil || model.isScanning)
+            .disabled(model.isScanning)
         }
-        .padding(18)
+        .padding(20)
     }
 
-    private var content: some View {
-        Group {
-            if model.groups.isEmpty && !model.isScanning {
-                emptyState
-            } else {
-                resultsView
+    private var emptyState: some View {
+        VStack(spacing: 18) {
+            Spacer()
+
+            Image(systemName: "magnifyingglass.circle")
+                .font(.system(size: 72))
+                .foregroundStyle(.blue)
+
+            Text("Find duplicate files")
+                .font(.system(size: 28, weight: .bold))
+
+            Text("Select a folder and Duplicate Finder will compare files\nby size and SHA-256 content hash.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+
+            Button("Choose Folder") {
+                model.chooseFolder()
             }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+
+            Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "magnifyingglass.circle")
-                .font(.system(size: 56))
-                .foregroundStyle(.secondary)
-            Text(model.selectedFolder == nil ? "Find duplicate files" : "Ready to scan")
-                .font(.title2.weight(.semibold))
-            Text(model.selectedFolder == nil
-                 ? "Choose a folder. Duplicate Finder compares exact file contents locally on your Mac."
-                 : "Start a scan to find exact duplicates in this folder.")
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 500)
-            if model.selectedFolder == nil {
-                Button("Choose Folder…") { model.chooseFolder() }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-            }
-        }
-        .padding(40)
-    }
+    private var results: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("\(model.groupCount) duplicate groups")
+                    .font(.headline)
 
-    private var resultsView: some View {
-        VStack(spacing: 0) {
-            if model.isScanning {
-                ProgressView(value: model.progress)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 12)
+                Text("• \(model.duplicateCount) files")
+                    .foregroundStyle(.secondary)
+
+                Text("• \(model.reclaimableSize) recoverable")
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                if model.isScanning {
+                    ProgressView()
+                }
             }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+
             List {
                 ForEach(model.groups) { group in
-                    DuplicateGroupRow(group: group, model: model)
+                    Section {
+                        ForEach(group.files) { file in
+                            FileRow(
+                                file: file,
+                                selected: model.selectedPaths.contains(file.path),
+                                onToggle: {
+                                    model.toggle(file)
+                                }
+                            )
+                        }
+                    } header: {
+                        HStack {
+                            Text("\(group.files.count) identical files")
+                                .font(.headline)
+
+                            Spacer()
+
+                            Text("Wasted: \(group.wastedSize)")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
-            .listStyle(.inset)
-            .padding(.top, 6)
         }
     }
 
-    private var footer: some View {
+    private var bottomBar: some View {
         HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                if model.groups.isEmpty {
-                    Text(model.status)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("\(model.groups.count) groups • \(model.totalDuplicateFiles) files • \(ByteCountFormatter.string(fromByteCount: model.duplicateBytes, countStyle: .file)) recoverable")
-                        .foregroundStyle(.secondary)
+            if !model.groups.isEmpty {
+                Button("Keep First") {
+                    model.selectKeepFirst()
+                }
+
+                Button("Clear Selection") {
+                    model.clearSelection()
                 }
             }
+
             Spacer()
-            if !model.selectedURLs.isEmpty {
-                Button("Clear Selection") { model.clearSelection() }
-                Button {
-                    model.moveSelectedToTrash()
-                } label: {
-                    Label("Move to Trash (\(model.selectedURLs.count))", systemImage: "trash")
-                }
-                .buttonStyle(.borderedProminent)
+
+            Text("\(model.selectedPaths.count) selected")
+                .foregroundStyle(.secondary)
+
+            Button("Move Selected to Trash") {
+                model.deleteSelected()
             }
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+            .disabled(model.selectedPaths.isEmpty || model.isScanning)
         }
-        .padding(12)
+        .padding(16)
     }
 }
 
-struct DuplicateGroupRow: View {
-    let group: DuplicateGroup
-    @ObservedObject var model: DuplicateFinderModel
+struct FileRow: View {
+    let file: DuplicateFile
+    let selected: Bool
+    let onToggle: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("\(group.items.count) identical files")
-                        .font(.headline)
-                    Text("Each file: \(ByteCountFormatter.string(fromByteCount: group.size, countStyle: .file)) • Wasted: \(ByteCountFormatter.string(fromByteCount: group.wastedBytes, countStyle: .file))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("Keep First") { model.selectAllButFirst(in: group) }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+        HStack(spacing: 12) {
+            Toggle("", isOn: Binding(
+                get: { selected },
+                set: { _ in onToggle() }
+            ))
+            .toggleStyle(.checkbox)
+            .labelsHidden()
+
+            Image(nsImage: NSWorkspace.shared.icon(forFile: file.path))
+                .resizable()
+                .frame(width: 34, height: 34)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(file.name)
+                    .font(.body.weight(.medium))
+                    .lineLimit(1)
+
+                Text(file.path)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
 
-            ForEach(Array(group.items.enumerated()), id: \.element.id) { index, item in
-                HStack(spacing: 10) {
-                    Toggle("", isOn: Binding(
-                        get: { model.selectedURLs.contains(item.url) },
-                        set: { _ in model.toggleSelection(item.url) }
-                    ))
-                    .labelsHidden()
-                    .toggleStyle(.checkbox)
+            Spacer()
 
-                    FileIcon(url: item.url)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.url.lastPathComponent)
-                            .fontWeight(index == 0 ? .semibold : .regular)
-                            .lineLimit(1)
-                        Text(item.url.deletingLastPathComponent().path)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer()
-                    if index == 0 {
-                        Text("Keep")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                    Text(ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file))
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.vertical, 3)
-            }
+            Text(file.formattedSize)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
-        .padding(.vertical, 6)
-    }
-}
-
-struct FileIcon: View {
-    let url: URL
-
-    var body: some View {
-        Image(nsImage: icon)
-            .resizable()
-            .aspectRatio(contentMode: .fit)
-            .frame(width: 28, height: 28)
-    }
-
-    private var icon: NSImage {
-        NSWorkspace.shared.icon(forFile: url.path)
+        .padding(.vertical, 4)
     }
 }
