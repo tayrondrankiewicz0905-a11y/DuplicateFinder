@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { collectEntries, entriesFromFileList, findDuplicates, regroupByHash, wastedBytes } from './lib/scan.js'
 import { formatBytes } from './lib/format.js'
+import { downloadDeleteScript } from './lib/deleteScript.js'
 import GroupCard from './components/GroupCard.jsx'
 import ScanProgress from './components/ScanProgress.jsx'
 
@@ -87,7 +88,10 @@ export default function App() {
       setSourceName(handle.name)
       await runScan(() => collectEntries(handle))
     } catch (err) {
-      if (err?.name !== 'AbortError') setError(err?.message || String(err))
+      if (err?.name === 'AbortError') return
+      // The picker can be unavailable or blocked (e.g. embedded/restricted
+      // modes) even when the API exists — fall back to the read-only picker.
+      inputRef.current?.click()
     }
   }, [runScan])
 
@@ -166,6 +170,11 @@ export default function App() {
     }
   }, [entries, selected])
 
+  const downloadScript = useCallback(() => {
+    if (selected.size === 0) return
+    downloadDeleteScript([...selected], sourceName)
+  }, [selected, sourceName])
+
   const busy = phase === 'scanning'
 
   return (
@@ -232,20 +241,32 @@ export default function App() {
               <button type="button" className="ghost" onClick={() => setSelected(new Set())}>
                 Auswahl leeren
               </button>
-              <button
-                type="button"
-                className="danger"
-                onClick={deleteSelected}
-                disabled={!canDelete || selected.size === 0 || deleting}
-                title={canDelete ? '' : 'Löschen ist nur mit der File System Access API verfügbar'}
-              >
-                {deleting ? 'Lösche …' : `Ausgewählte löschen (${selected.size})`}
-              </button>
+              {canDelete ? (
+                <button
+                  type="button"
+                  className="danger"
+                  onClick={deleteSelected}
+                  disabled={selected.size === 0 || deleting}
+                >
+                  {deleting ? 'Lösche …' : `Ausgewählte löschen (${selected.size})`}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="danger"
+                  onClick={downloadScript}
+                  disabled={selected.size === 0}
+                >
+                  Lösch-Skript herunterladen ({selected.size})
+                </button>
+              )}
             </div>
 
             {!canDelete && (
               <div className="note">
-                Dieser Browser/Modus erlaubt kein Löschen. Für Löschen im Chrome/Edge „Ordner wählen“ nutzen.
+                Dein Browser erlaubt kein direktes Löschen von Dateien. Lade das Lösch-Skript
+                herunter und führe es im gescannten Ordner aus – so klappt das Aufräumen in jedem
+                Browser.
               </div>
             )}
 
