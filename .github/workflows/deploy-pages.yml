@@ -1,55 +1,41 @@
-name: Deploy Web App to GitHub Pages
+name: Deploy DuplicateFinder Website
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
+  workflow_dispatch:
 
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
   contents: read
   pages: write
   id-token: write
 
-# Allow only one concurrent deployment
 concurrency:
-  group: pages
+  group: "pages"
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build & Deploy to Pages
+  deploy:
+    name: Build and Deploy to GitHub Pages
     runs-on: ubuntu-latest
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
-      - name: Repository herunterladen
-        uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v6
 
-      - name: Node.js einrichten
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Abhängigkeiten installieren
-        run: npm ci
-
-      - name: Web-App bauen
-        run: npm run build
-        env:
-          GITHUB_ACTIONS: 'true'
-
-      - name: Pages einrichten
+      - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
-      - name: Build-Artefakt hochladen
-        uses: actions/upload-pages-artifact@v3
+      - name: Upload Website
+        uses: actions/upload-pages-artifact@v4
         with:
-          path: dist
+          path: '.'
 
-      - name: Auf GitHub Pages bereitstellen
+      - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
